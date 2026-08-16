@@ -70,6 +70,43 @@ visibility predicate is unchanged but evaluated without `asin`/`sqrt`/divide,
 which is 2-4x faster and, at the elevation threshold, closer to the float64
 answer.
 
+### Spherical-cap culling (opt-in)
+
+A satellite is only visible within a cap of half-angle
+`arccos((Rg/r)·cos(el)) - el` around its sub-satellite point. `GroundIndex`
+bins the ground points so each satellite only visits the cells its cap
+overlaps. Results are bit-identical to the brute-force kernel; the cap is
+computed from the smallest ground radius, so the cull can never drop a point
+the exact test would have accepted.
+
+Whether it pays depends almost entirely on the elevation mask, because the
+brute-force kernel already stops at the first visible satellite (P=65341,
+T=1000, RTX 3080):
+
+| min elevation | 100 sats | 400 sats |
+|---|---|---|
+| 10° | 1.3x | 0.8x (slower) |
+| 25° | 2.8x | 3.3x |
+| 40° | 4.8x | 6.2x |
+
+So use it for high elevation masks, and stick with the default kernel for
+near-horizon visibility with a dense constellation.
+
+```python
+from tensorgator.fused import GroundIndex, visibility_cuda_culled, coverage_max_gaps_culled
+
+index = GroundIndex(ground_points)          # build once, reuse
+vis = visibility_cuda_culled(positions, index, min_elevation_rad)
+```
+
+### Ground tracks
+
+`ecef_to_lla` and `cart_to_lat_lon` are vectorised over any array shape
+(~3.7 M points/s) instead of one python call per sample, and `ground_track`
+converts a whole `(num_sats, num_times, 3)` result at once. They also no
+longer divide by zero on the polar axis, where the old height formula raised
+`ZeroDivisionError`.
+
 ## Features
 
 - **CUDA Acceleration**: Propagate thousands of satellites simultaneously using GPU parallelization

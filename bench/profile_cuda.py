@@ -4,7 +4,7 @@ Profiling / regression harness for the CUDA backend.
     python -m tensorgator.bench.profile_cuda           # everything
     python -m tensorgator.bench.profile_cuda accuracy  # one section
 
-Sections: phases, ceiling, alloc, blocks, accuracy, endtoend, coverage
+Sections: phases, ceiling, alloc, blocks, accuracy, endtoend, coverage, culling
 """
 
 import gc
@@ -253,8 +253,41 @@ def coverage():
         del p
 
 
+def culling():
+    """Cap culling vs brute force. The win tracks the elevation mask."""
+    from ..fused import visibility_cuda, visibility_cuda_culled, GroundIndex
+
+    T = 1000
+    times = np.arange(T, dtype=np.float64) * 60
+    lats = np.arange(-90, 91, 1); lons = np.arange(-180, 181, 1)
+    la, lo = np.meshgrid(np.radians(lats), np.radians(lons), indexing='ij')
+    la = la.ravel(); lo = lo.ravel()
+    gp = np.column_stack([RE*np.cos(la)*np.cos(lo), RE*np.cos(la)*np.sin(lo), RE*np.sin(la)])
+    index = GroundIndex(gp)
+    print()
+    print(f"== cap culling, P={len(gp)} T={T} ==")
+    print(f"  {'sats':>6}{'min_el':>8}{'vis frac':>10}{'brute':>10}{'culled':>10}{'speedup':>9}{'exact':>8}")
+    for S in [100, 400]:
+        rng = np.random.default_rng(5)
+        els = np.column_stack([RE + rng.uniform(500e3, 600e3, S), np.zeros(S),
+                               np.radians(rng.uniform(0, 90, S)), np.radians(rng.uniform(0, 360, S)),
+                               np.radians(rng.uniform(0, 360, S)), np.radians(rng.uniform(0, 360, S))])
+        p = Propagator(S, T)
+        pos = p.run(els, times, out='device')
+        for el in [10.0, 25.0, 40.0]:
+            me = math.radians(el)
+            a = best(lambda: visibility_cuda(pos, gp, me, out='device'))
+            b = best(lambda: visibility_cuda_culled(pos, index, me, out='device'))
+            ref = visibility_cuda(pos, gp, me)
+            ok = np.array_equal(ref, visibility_cuda_culled(pos, index, me))
+            print(f"  {S:>6}{el:>8.0f}{ref.mean():>10.3f}{a*1e3:>9.1f}ms{b*1e3:>9.1f}ms"
+                  f"{a/b:>8.1f}x{str(ok):>8}")
+        del p
+
+
 SECTIONS = dict(phases=phases, ceiling=ceiling, alloc=alloc, blocks=blocks,
-                accuracy=accuracy, endtoend=endtoend, coverage=coverage)
+                accuracy=accuracy, endtoend=endtoend, coverage=coverage,
+                culling=culling)
 
 if __name__ == '__main__':
     print(f"device: {cuda.get_current_device().name.decode()}")
