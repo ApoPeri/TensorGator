@@ -4,108 +4,21 @@ TensorGator is a CUDA-accelerated satellite propagation library designed for mas
 
 ## Performance
 
-TensorGator's CUDA backend provides significant performance improvements over CPU-based propagation.
+TensorGator's CUDA backend is far faster than the CPU backend for large constellations. On a 500,000 satellite × 500 timestep problem (250M positions, RTX 3080, float32, ECEF):
 
-**500,000 satellites x 500 timesteps (250M positions), RTX 3080, float32, ECEF:**
+| How results are consumed | Time |
+|---|---|
+| `backend='cuda'`, new array per call | 1.00 s |
+| `Propagator(..., pinned=True)`, `out='pinned'` | 0.13 s |
+| `Propagator`, `out='device'` (stays on the GPU) | 0.012 s |
 
-| How results are consumed | Time | vs previous kernel |
-|---|---|---|
-| `backend='cuda_legacy'` (the original kernel) | 10.5 s | 1x |
-| `backend='cuda'`, new array per call | 1.00 s | 10x |
-| `Propagator(..., pinned=True)`, `out='pinned'` | 0.13 s | 81x |
-| `Propagator`, `out='device'` (stays on the GPU) | 0.012 s | 865x |
-
-The propagation kernel itself runs in ~5 ms, which is 100% of the achievable
-pure-store bandwidth for this output size — the remaining time is moving
-results to the host, so keeping them on the device is by far the largest win.
-Accuracy improved at the same time: float32 error against a float64 reference
-is ~4 m mean / ~25 m max and stays flat over a 30-day arc, where the original
-kernel drifted to 263 m mean with occasional 20 km outliers.
+The propagation kernel itself runs in ~5 ms; the remaining time is spent moving results to the host. The CPU backend is available as a fallback, but the same workload is orders of magnitude slower on CPU.
 
 Reproduce with:
 
 ```bash
 python -m tensorgator.bench.profile_cuda
 ```
-
-### Reusing buffers
-
-Allocating the output buffer costs ~13x more than running the kernel, so for
-repeated propagation use `Propagator`, which keeps its device buffers:
-
-```python
-from tensorgator.prop_cuda_fast import Propagator
-
-prop = Propagator(num_sats, num_times, pinned=True)
-for elements in scenarios:
-    positions = prop.run(elements, times, out='device')   # feed straight into
-    visibility = calculate_visibility_cuda(positions, ground_points, min_el)
-```
-
-`out='device'` returns a numba device array, `out='pinned'` a numpy view of a
-reused page-locked buffer (each call overwrites the previous result),
-`out=array` writes in place, and `out=None` returns a fresh array.
-
-### Coverage analysis
-
-`calculate_visibility_cuda` and `calculate_max_gaps` were both upgraded, and
-the two can be fused so the P x T visibility array is never built at all:
-
-| Pipeline (10 sats, 14400 steps, 2701 ground points) | Time |
-|---|---|
-| propagate + visibility + `calculate_max_gaps` (as it was) | 1.62 s |
-| the same three calls today | ~0.05 s |
-| `coverage_report` (fused, statistics only cross PCIe) | **0.010 s** |
-
-```python
-from tensorgator.fused import coverage_report, coverage_max_gaps_cuda
-
-max_gaps, visible_fraction = coverage_report(constellation, times,
-                                             ground_points, min_elevation_rad)
-```
-
-`coverage_max_gaps_cuda` does the same from positions you already have (numpy
-or device array). Results are bit-identical to the previous pipeline. The
-visibility predicate is unchanged but evaluated without `asin`/`sqrt`/divide,
-which is 2-4x faster and, at the elevation threshold, closer to the float64
-answer.
-
-### Spherical-cap culling (opt-in)
-
-A satellite is only visible within a cap of half-angle
-`arccos((Rg/r)·cos(el)) - el` around its sub-satellite point. `GroundIndex`
-bins the ground points so each satellite only visits the cells its cap
-overlaps. Results are bit-identical to the brute-force kernel; the cap is
-computed from the smallest ground radius, so the cull can never drop a point
-the exact test would have accepted.
-
-Whether it pays depends almost entirely on the elevation mask, because the
-brute-force kernel already stops at the first visible satellite (P=65341,
-T=1000, RTX 3080):
-
-| min elevation | 100 sats | 400 sats |
-|---|---|---|
-| 10° | 1.3x | 0.8x (slower) |
-| 25° | 2.8x | 3.3x |
-| 40° | 4.8x | 6.2x |
-
-So use it for high elevation masks, and stick with the default kernel for
-near-horizon visibility with a dense constellation.
-
-```python
-from tensorgator.fused import GroundIndex, visibility_cuda_culled, coverage_max_gaps_culled
-
-index = GroundIndex(ground_points)          # build once, reuse
-vis = visibility_cuda_culled(positions, index, min_elevation_rad)
-```
-
-### Ground tracks
-
-`ecef_to_lla` and `cart_to_lat_lon` are vectorised over any array shape
-(~3.7 M points/s) instead of one python call per sample, and `ground_track`
-converts a whole `(num_sats, num_times, 3)` result at once. They also no
-longer divide by zero on the polar axis, where the old height formula raised
-`ZeroDivisionError`.
 
 ## Features
 
