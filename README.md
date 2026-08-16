@@ -46,6 +46,30 @@ for elements in scenarios:
 reused page-locked buffer (each call overwrites the previous result),
 `out=array` writes in place, and `out=None` returns a fresh array.
 
+### Coverage analysis
+
+`calculate_visibility_cuda` and `calculate_max_gaps` were both upgraded, and
+the two can be fused so the P x T visibility array is never built at all:
+
+| Pipeline (10 sats, 14400 steps, 2701 ground points) | Time |
+|---|---|
+| propagate + visibility + `calculate_max_gaps` (as it was) | 1.62 s |
+| the same three calls today | ~0.05 s |
+| `coverage_report` (fused, statistics only cross PCIe) | **0.010 s** |
+
+```python
+from tensorgator.fused import coverage_report, coverage_max_gaps_cuda
+
+max_gaps, visible_fraction = coverage_report(constellation, times,
+                                             ground_points, min_elevation_rad)
+```
+
+`coverage_max_gaps_cuda` does the same from positions you already have (numpy
+or device array). Results are bit-identical to the previous pipeline. The
+visibility predicate is unchanged but evaluated without `asin`/`sqrt`/divide,
+which is 2-4x faster and, at the elevation threshold, closer to the float64
+answer.
+
 ## Features
 
 - **CUDA Acceleration**: Propagate thousands of satellites simultaneously using GPU parallelization
@@ -173,15 +197,15 @@ Parameters:
 ### Visibility Analysis
 
 ```python
-tg.calculate_visibility(satellite_positions, ground_stations, min_elevation=10.0)
+tg.calculate_visibility_cuda(satellite_positions, ground_points, min_elevation_rad)
 ```
 
 Calculates visibility between satellites and ground points.
 
 Parameters:
 - `satellite_positions`: Array of satellite positions (ECEF)
-- `ground_stations`: Array of ground points coordinates (lat, lon, alt)
-- `min_elevation`: Minimum elevation angle for visibility (degrees)
+- `ground_points`: Array of ground point coordinates in ECEF metres, shape (P, 3)
+- `min_elevation`: Minimum elevation angle for visibility (radians)
 
 Returns a boolean array indicating visibility.
 

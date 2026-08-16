@@ -37,6 +37,7 @@ from numba import cuda, float32, float64
 from numba.cuda import libdevice
 
 from .constants import MU, J2, RE
+from .coord_conv import gmst_from_seconds
 
 _TWO_PI = 6.283185307179586
 _INV_TWO_PI = 1.0 / _TWO_PI
@@ -53,14 +54,8 @@ _NINV = 12
 _kernel_cache = {}
 
 
-def gmst_from_seconds(seconds):
-    """Vectorised GMST (radians). Matches coord_conv.calculate_gmst_from_seconds."""
-    s = np.asarray(seconds, dtype=np.float64)
-    T = (s / 86400.0) / 36525.0
-    gmst0 = (100.46061837 + 36000.770053608 * T + 0.000387933 * T * T
-             - (T ** 3) / 38710000.0)
-    gmst_deg = gmst0 + 360.98564736629 * (np.mod(s, 86400.0) / 86400.0)
-    return np.mod(gmst_deg, 360.0) * (math.pi / 180.0)
+# gmst_from_seconds lives in coord_conv (no CUDA dependency); re-exported here
+# because this module is where callers of the fast path look for it.
 
 
 def _make_kernels(dtype, fastmath=True):

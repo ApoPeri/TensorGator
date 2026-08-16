@@ -4,7 +4,7 @@ Profiling / regression harness for the CUDA backend.
     python -m tensorgator.bench.profile_cuda           # everything
     python -m tensorgator.bench.profile_cuda accuracy  # one section
 
-Sections: phases, ceiling, alloc, blocks, accuracy, endtoend
+Sections: phases, ceiling, alloc, blocks, accuracy, endtoend, coverage
 """
 
 import gc
@@ -17,7 +17,8 @@ from numba import cuda, float32
 
 from ..constants import MU, J2, RE
 from ..prop_cuda import propagate_constellation_cuda_legacy
-from ..prop_cuda_fast import Propagator, gmst_from_seconds
+from ..prop_cuda_fast import Propagator
+from ..coord_conv import gmst_from_seconds
 
 
 def make(n, emax=0.02, seed=21):
@@ -194,8 +195,66 @@ def endtoend():
         del p, p1
 
 
+def coverage():
+    """The fused visibility + gap pipeline against the original one."""
+    from ..visibility import calculate_visibility_cuda_legacy, calculate_max_gaps
+    from ..fused import visibility_cuda, coverage_report
+
+    def py_max_gaps(visibility, time_step):
+        num_points, num_times = visibility.shape
+        out = np.zeros(num_points)
+        for q in range(num_points):
+            row = visibility[q]; cur = 0; peak = 0
+            for t in range(num_times):
+                if not row[t]:
+                    cur += 1
+                else:
+                    if cur > peak: peak = cur
+                    cur = 0
+            if cur > peak: peak = cur
+            out[q] = peak * time_step
+        return out
+
+    min_el = math.radians(10.0)
+    for label, S, T, gstep in [("coverage_map example", 10, 14400, 5),
+                               ("dense 2 deg grid", 60, 5000, 2),
+                               ("large constellation", 2000, 2000, 5)]:
+        rng = np.random.default_rng(21)
+        els = np.column_stack([RE + rng.uniform(500e3, 2000e3, S), np.zeros(S),
+                               np.radians(rng.uniform(0, 90, S)), np.radians(rng.uniform(0, 360, S)),
+                               np.radians(rng.uniform(0, 360, S)), np.radians(rng.uniform(0, 360, S))])
+        times = np.arange(T, dtype=np.float64) * 60
+        lats = np.arange(-90, 91, gstep); lons = np.arange(-180, 181, gstep)
+        la, lo = np.meshgrid(np.radians(lats), np.radians(lons), indexing='ij')
+        la = la.ravel(); lo = lo.ravel()
+        gp = np.column_stack([RE*np.cos(la)*np.cos(lo), RE*np.cos(la)*np.sin(lo), RE*np.sin(la)])
+        P = len(gp)
+        print()
+        print(f"== coverage: {label}  S={S} T={T} P={P} ({P*T*S/1e9:.2f} G tests) ==")
+
+        p = Propagator(S, T)
+        pos = p.run(els, times)
+        gpf = gp.astype(np.float32)
+        vo = best(lambda: calculate_visibility_cuda_legacy(pos, gpf, min_el))
+        vn = best(lambda: visibility_cuda(pos, gpf, min_el))
+        vis = visibility_cuda(pos, gpf, min_el)
+
+        t0 = time.perf_counter()
+        old = py_max_gaps(calculate_visibility_cuda_legacy(p.run(els, times), gpf, min_el), 60)
+        t_old = time.perf_counter() - t0
+        gj = best(lambda: calculate_max_gaps(vis, 60))
+        t_new = best(lambda: coverage_report(els, times, gp, min_el, propagator=p))
+        new = coverage_report(els, times, gp, min_el, propagator=p)[0]
+
+        print(f"  visibility kernel : {vo*1e3:8.1f} ms -> {vn*1e3:8.1f} ms  ({vo/vn:.1f}x)")
+        print(f"  max_gaps njit     : {gj*1e3:8.1f} ms")
+        print(f"  full pipeline     : {t_old:8.3f} s  -> {t_new:8.3f} s  ({t_old/t_new:.0f}x)"
+              f"   identical={np.array_equal(old, new)}")
+        del p
+
+
 SECTIONS = dict(phases=phases, ceiling=ceiling, alloc=alloc, blocks=blocks,
-                accuracy=accuracy, endtoend=endtoend)
+                accuracy=accuracy, endtoend=endtoend, coverage=coverage)
 
 if __name__ == '__main__':
     print(f"device: {cuda.get_current_device().name.decode()}")

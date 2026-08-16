@@ -87,18 +87,31 @@ def visibility_kernel(sat_positions, ground_points, min_elevation, visibility):
                 visibility[p_idx, t_idx] = 1
                 break
 
-def calculate_visibility_cuda(satellite_positions, ground_points, min_elevation):
+def calculate_visibility_cuda(satellite_positions, ground_points, min_elevation, out='host'):
     """
     Calculate visibility for all ground points using CUDA.
-    
+
     Args:
-        satellite_positions: Array of shape (num_sats, num_times, 3)
-        ground_points: Array of shape (num_points, 3)
+        satellite_positions: Array of shape (num_sats, num_times, 3), numpy or
+                             device array (e.g. Propagator(...).run(out='device'))
+        ground_points: Array of shape (num_points, 3) in ECEF metres
         min_elevation: Minimum elevation angle in radians
-        
+        out: 'host' for a numpy bool array, 'device' to keep it on the GPU
+
     Returns:
         visibility: Boolean array of shape (num_points, num_times)
+
+    Delegates to fused.visibility_cuda, which evaluates the same predicate
+    without asin/sqrt/divide. The original kernel is calculate_visibility_cuda_legacy.
+    If you only need coverage statistics, fused.coverage_max_gaps_cuda avoids
+    building this array at all.
     """
+    from .fused import visibility_cuda
+    return visibility_cuda(satellite_positions, ground_points, min_elevation, out=out)
+
+
+def calculate_visibility_cuda_legacy(satellite_positions, ground_points, min_elevation):
+    """Original visibility kernel, kept for comparison."""
     num_points = len(ground_points)
     num_times = satellite_positions.shape[1]
     
@@ -123,50 +136,40 @@ def calculate_visibility_cuda(satellite_positions, ground_points, min_elevation)
     
     return visibility.astype(bool)
 
+@njit(parallel=True, cache=True)
+def _max_gaps_kernel(visibility, time_step):
+    num_points, num_times = visibility.shape
+    max_gaps = np.zeros(num_points)
+    for p in prange(num_points):
+        current_gap = 0
+        max_gap = 0
+        for t in range(num_times):
+            if not visibility[p, t]:
+                current_gap += 1
+                if current_gap > max_gap:
+                    max_gap = current_gap
+            else:
+                current_gap = 0
+        max_gaps[p] = max_gap * time_step
+    return max_gaps
+
+
 def calculate_max_gaps(visibility, time_step):
     """
     Calculate maximum gap durations for each ground point.
-    Non-JIT version that works reliably.
-    
+
     Args:
         visibility: Boolean array of shape (num_points, num_times)
         time_step: Time step in seconds
-        
+
     Returns:
         max_gaps: Array of shape (num_points,) with maximum gap duration in seconds
+
+    This was a pure python double loop and measured as 74% of the coverage
+    workflow; it is now a parallel njit scan. To skip building the visibility
+    array entirely, use fused.coverage_max_gaps_cuda.
     """
-    num_points = visibility.shape[0]
-    num_times = visibility.shape[1]
-    max_gaps = np.zeros(num_points)
-    
-    # Use tqdm if available for progress tracking
-    try:
-        from tqdm import tqdm
-        iterator = tqdm(range(num_points), desc="Calculating gaps")
-    except ImportError:
-        iterator = range(num_points)
-    
-    for p in iterator:
-        vis_timeline = visibility[p]
-        
-        # Find the longest sequence of False values (gaps)
-        current_gap = 0
-        max_gap = 0
-        
-        for t in range(num_times):
-            if not vis_timeline[t]:  # Gap (not visible)
-                current_gap += 1
-            else:  # Visible
-                max_gap = max(max_gap, current_gap)
-                current_gap = 0
-        
-        # Check final gap
-        max_gap = max(max_gap, current_gap)
-        
-        # Convert to time
-        max_gaps[p] = max_gap * time_step
-    
-    return max_gaps
+    return _max_gaps_kernel(np.ascontiguousarray(visibility), float(time_step))
 
 def process_in_chunks(satellite_elements, times, ground_points, min_elevation, chunk_size=1000):
     """
