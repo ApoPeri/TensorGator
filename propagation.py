@@ -60,15 +60,15 @@ def satellite_positions(times, constellation, backend='cpu', return_frame='ecef'
         else:
             # Return ECI coordinates
             return positions_eci
-    elif backend == 'cuda':
-        from .prop_cuda import propagate_constellation_cuda
-        return propagate_constellation_cuda(constellation, times, return_frame=return_frame,
-                                           epochs=epochs, input_type=input_type)
-    elif backend == 'cuda_fast':
-        # Same model and API, optimised kernel. Extra keywords (dtype, out,
-        # sat_chunk) are available via prop_cuda_fast directly.
+    elif backend in ('cuda', 'cuda_fast'):
+        # 'cuda_fast' is kept as an alias; 'cuda' now uses the optimised kernel.
+        # Extra keywords (dtype, out) are forwarded to prop_cuda_fast.
         from .prop_cuda_fast import propagate_constellation_cuda_fast
         return propagate_constellation_cuda_fast(constellation, times, return_frame=return_frame,
                                                  epochs=epochs, input_type=input_type, **kwargs)
+    elif backend == 'cuda_legacy':
+        from .prop_cuda import propagate_constellation_cuda_legacy
+        return propagate_constellation_cuda_legacy(constellation, times, return_frame=return_frame,
+                                                   epochs=epochs, input_type=input_type)
     else:
         raise ValueError(f"Unknown backend: {backend}")

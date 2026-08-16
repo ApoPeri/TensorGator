@@ -4,9 +4,47 @@ TensorGator is a CUDA-accelerated satellite propagation library designed for mas
 
 ## Performance
 
-TensorGator's CUDA backend provides significant performance improvements over CPU-based propagation:
+TensorGator's CUDA backend provides significant performance improvements over CPU-based propagation.
 
-- **Large Constellations (1000+ satellites)**:  Using batch sizes: 500,000 satellites, 500 timesteps in ~21 seconds. Tested on Google Colab T4 GPU (15GB VRAM)
+**500,000 satellites x 500 timesteps (250M positions), RTX 3080, float32, ECEF:**
+
+| How results are consumed | Time | vs previous kernel |
+|---|---|---|
+| `backend='cuda_legacy'` (the original kernel) | 10.5 s | 1x |
+| `backend='cuda'`, new array per call | 1.00 s | 10x |
+| `Propagator(..., pinned=True)`, `out='pinned'` | 0.13 s | 81x |
+| `Propagator`, `out='device'` (stays on the GPU) | 0.012 s | 865x |
+
+The propagation kernel itself runs in ~5 ms, which is 100% of the achievable
+pure-store bandwidth for this output size — the remaining time is moving
+results to the host, so keeping them on the device is by far the largest win.
+Accuracy improved at the same time: float32 error against a float64 reference
+is ~4 m mean / ~25 m max and stays flat over a 30-day arc, where the original
+kernel drifted to 263 m mean with occasional 20 km outliers.
+
+Reproduce with:
+
+```bash
+python -m tensorgator.bench.profile_cuda
+```
+
+### Reusing buffers
+
+Allocating the output buffer costs ~13x more than running the kernel, so for
+repeated propagation use `Propagator`, which keeps its device buffers:
+
+```python
+from tensorgator.prop_cuda_fast import Propagator
+
+prop = Propagator(num_sats, num_times, pinned=True)
+for elements in scenarios:
+    positions = prop.run(elements, times, out='device')   # feed straight into
+    visibility = calculate_visibility_cuda(positions, ground_points, min_el)
+```
+
+`out='device'` returns a numba device array, `out='pinned'` a numpy view of a
+reused page-locked buffer (each call overwrites the previous result),
+`out=array` writes in place, and `out=None` returns a fresh array.
 
 ## Features
 
@@ -127,7 +165,7 @@ Propagates satellite positions over time using either CPU or CUDA backend.
 Parameters:
 - `times`: Array of times (seconds since J2000 or reference epoch)
 - `constellation`: Array of satellite elements (Keplerian or position-velocity)
-- `backend`: 'cpu' or 'cuda'
+- `backend`: 'cpu', 'cuda' (optimised GPU kernel) or 'cuda_legacy' (original kernel)
 - `return_frame`: Coordinate frame to return ('ecef' or 'eci')
 - `epochs`: Optional array of epoch times for each satellite
 - `input_type`: 'kepler' for Keplerian elements or 'rv' for position-velocity vectors

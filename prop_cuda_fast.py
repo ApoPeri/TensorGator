@@ -1,19 +1,33 @@
 """
-Optimised CUDA propagator (drop-in alternative to prop_cuda.propagate_constellation_cuda).
+Optimised CUDA propagator.
 
-Key differences from prop_cuda.py:
-  1. All device math is genuinely single precision (the original promotes every
-     expression to float64 because mu/j2/re arrive as Python floats).
-  2. The ECI->ECEF rotation is folded into the RAAN angle inside the kernel, so
-     the host-side per-timestep rotation pass disappears entirely.
-  3. Per-satellite invariants (mean motion, J2 rates, sin/cos of inclination...)
-     are computed once on the host instead of once per (satellite, timestep).
-  4. Kepler's equation is solved with a Halley iteration seeded by a 2nd-order
-     series instead of a 10-node contour integral.
-  5. Thread x-index runs along time so warps read satellite data by broadcast
-     and write consecutive positions.
-  6. Optional satellite-chunked, stream-overlapped, pinned-memory device->host
-     transfer, or a device-resident return for downstream GPU work.
+This is the implementation behind ``backend='cuda'``; the original kernel is
+kept as ``backend='cuda_legacy'`` (prop_cuda.py) for comparison.
+
+Design notes, each driven by a measurement (see bench/profile_cuda.py):
+
+  * All device math is genuinely single precision. The original promotes every
+    expression to float64 -- not because of the mu/j2/re arguments alone, but
+    because every untyped literal (3/2, 0.5, 2.0*pi, 1e-14) is a Python float
+    and numba promotes on contact. Passing np.float32 scalars is NOT enough;
+    every constant has to be built from the target type.
+  * The ECI->ECEF rotation is folded into RAAN: Rz(-g)Rz(raan) == Rz(raan-g).
+    That deletes the host-side per-timestep rotation pass entirely.
+  * Per-satellite invariants are computed once by a small float64 prep kernel
+    rather than once per (satellite, timestep) in float32.
+  * Kepler's equation uses a series-seeded Halley iteration, and the true
+    anomaly is skipped: x = a(cosE - e), y = a*sqrt(1-e^2)*sinE is exact.
+  * The mean motion is carried as a hi/lo float32 pair and the mean anomaly is
+    range-reduced with a Cody-Waite split. The kernel runs at ~100% of the
+    achievable pure-store rate, so this extra arithmetic is free, and it buys
+    ~3 orders of magnitude of long-arc accuracy (30-day max error 22.9 km -> 27 m).
+  * Thread x-index runs along time, so satellite data is read by warp broadcast
+    and stores are near-contiguous.
+  * Propagator reuses its device buffers. Allocating a fresh 3 GB device buffer
+    costs ~77 ms per call on WDDM, 13x the ~6 ms kernel.
+  * What is left is the device->host copy. Into a freshly allocated numpy array
+    most of that is first-touch page faulting, not PCIe; a reused pinned buffer
+    cuts 500k x 500 from ~850 ms to ~145 ms.
 """
 
 import math
@@ -23,48 +37,121 @@ from numba import cuda, float32, float64
 from numba.cuda import libdevice
 
 from .constants import MU, J2, RE
-from .coord_conv import calculate_gmst_from_seconds
 
 _TWO_PI = 6.283185307179586
 _INV_TWO_PI = 1.0 / _TWO_PI
 
-# 2*pi split into two float32 pieces so the range reduction keeps full
-# precision even when the accumulated mean anomaly is ~100 rad.
+# 2*pi split into two float32 pieces so the range reduction stays accurate
+# even when the accumulated mean anomaly reaches hundreds of radians.
 _TWO_PI_HI_F32 = float(np.float32(_TWO_PI))
 _TWO_PI_LO_F32 = float(np.float32(_TWO_PI - _TWO_PI_HI_F32))
+
+# inv columns
+_A, _E, _NHI, _NLO, _DRAAN, _DARGP, _M0, _RAAN0, _ARGP0, _COSI, _SINI, _B = range(12)
+_NINV = 12
 
 _kernel_cache = {}
 
 
-def _make_kernel(dtype):
-    """Build the propagation kernel for a given floating point type."""
-    key = np.dtype(dtype).name
+def gmst_from_seconds(seconds):
+    """Vectorised GMST (radians). Matches coord_conv.calculate_gmst_from_seconds."""
+    s = np.asarray(seconds, dtype=np.float64)
+    T = (s / 86400.0) / 36525.0
+    gmst0 = (100.46061837 + 36000.770053608 * T + 0.000387933 * T * T
+             - (T ** 3) / 38710000.0)
+    gmst_deg = gmst0 + 360.98564736629 * (np.mod(s, 86400.0) / 86400.0)
+    return np.mod(gmst_deg, 360.0) * (math.pi / 180.0)
+
+
+def _make_kernels(dtype, fastmath=True):
+    """
+    Build (prep, propagate) kernels for a given floating point type.
+
+    fastmath=False swaps the approximate sin/cos (sin.approx.f32, ~2^-20
+    relative) for the accurate libdevice ones. Measured at N=500k T=500:
+    error 4.0 -> 1.8 m mean, 23 -> 12 m max, but the kernel goes 4.7 -> 14.6 ms
+    because the approximate trig is precisely what lets it reach the store
+    bandwidth ceiling. Worth it when results are copied back to the host (the
+    extra 10 ms hides behind a ~145 ms transfer); not worth it for
+    device-resident work, where it is a straight 3x on the only cost there is.
+    """
+    key = (np.dtype(dtype).name, bool(fastmath))
     if key in _kernel_cache:
         return _kernel_cache[key]
 
-    if key == 'float32':
+    if key[0] == 'float32':
         flt, fma, rint = float32, libdevice.fmaf, libdevice.rintf
         two_pi_hi, two_pi_lo = _TWO_PI_HI_F32, _TWO_PI_LO_F32
-    else:
+        split = True
+    elif key[0] == 'float64':
         flt, fma, rint = float64, libdevice.fma, libdevice.rint
         two_pi_hi, two_pi_lo = _TWO_PI, 0.0
+        split = False
+    else:
+        raise ValueError("dtype must be float32 or float64")
 
-    # fastmath is deliberately OFF here: the fma-based residual is what keeps
-    # the mean anomaly accurate, and unsafe algebra would fold it away.
+    # Runs in float64 regardless of the output type: these are per-satellite
+    # constants whose error is amplified by the full propagation arc. The
+    # satellite epoch is absorbed into the angles here, so the kernel never
+    # subtracts two large times in float32 (that cost ~600 m of accuracy).
+    @cuda.jit
+    def prep(elements, epochs, inv):
+        i = cuda.grid(1)
+        if i >= elements.shape[0]:
+            return
+        a = elements[i, 0]
+        e = elements[i, 1]
+        inc = elements[i, 2]
+
+        n0 = math.sqrt(MU / (a * a * a))
+        om = 1.0 - e * e
+        j2s = (n0 * RE * RE * J2) / (a * a * om * om)
+        si = math.sin(inc)
+        ci = math.cos(inc)
+        n_tot = n0 + 0.75 * j2s * math.sqrt(om) * (2.0 - 3.0 * si * si)
+        draan = -1.5 * j2s * ci
+        dargp = 0.75 * j2s * (4.0 - 5.0 * si * si)
+
+        # angles rewound to the common time origin: theta(t) = theta0' + rate*t
+        ep = epochs[i]
+        M0 = (elements[i, 5] - n_tot * ep) % _TWO_PI
+        raan0 = (elements[i, 3] - draan * ep) % _TWO_PI
+        argp0 = (elements[i, 4] - dargp * ep) % _TWO_PI
+
+        inv[i, _A] = a
+        inv[i, _E] = e
+        if split:
+            nhi = float32(n_tot)
+            inv[i, _NHI] = nhi
+            inv[i, _NLO] = float32(n_tot - nhi)
+        else:
+            inv[i, _NHI] = n_tot
+            inv[i, _NLO] = 0.0
+        inv[i, _DRAAN] = draan
+        inv[i, _DARGP] = dargp
+        inv[i, _M0] = M0
+        inv[i, _RAAN0] = raan0
+        inv[i, _ARGP0] = argp0
+        inv[i, _COSI] = ci
+        inv[i, _SINI] = si
+        inv[i, _B] = a * math.sqrt(om)
+
+    # fastmath is deliberately OFF here: the fma residual is what keeps the mean
+    # anomaly accurate, and unsafe algebra would fold it away.
     @cuda.jit(device=True, inline=False, fastmath=False)
-    def _phase(M0, n, t):
-        p = n * t
-        q = fma(n, t, -p)                      # exact low bits of n*t
+    def _phase(M0, n_hi, n_lo, t):
+        p = n_hi * t
+        q = fma(n_hi, t, -p) + n_lo * t        # exact low bits + lo term
         k = rint(p * flt(_INV_TWO_PI))
         r = (p - k * flt(two_pi_hi)) - k * flt(two_pi_lo)
         return r + q + M0
 
-    @cuda.jit(device=True, inline=True, fastmath=True)
+    @cuda.jit(device=True, inline=True, fastmath=fastmath)
     def _kepler_sincos(M, e):
-        """Return (sin E, cos E) for E - e sin E = M."""
+        """Return (sin E, cos E) solving E - e sin E = M."""
         sM = math.sin(M)
         cM = math.cos(M)
-        if e < flt(1e-7):                      # warp-uniform: same sat per warp
+        if e < flt(1e-7):                      # warp-uniform: one sat per warp
             return sM, cM
 
         E = M + e * sM * (flt(1.0) + e * cM)   # 2nd order series seed
@@ -78,50 +165,40 @@ def _make_kernel(dtype):
             E = E - d
             sE = math.sin(E)
             cE = math.cos(E)
-        # one more Halley step, propagated onto sin/cos by first order Taylor
+        # final Halley step folded onto sin/cos by first order Taylor
         f = E - e * sE - M
         fp = flt(1.0) - e * cE
         d = f / fp
         d = f / (fp - flt(0.5) * d * e * sE)
         return sE - d * cE, cE + d * sE
 
-    @cuda.jit(fastmath=True)
-    def kernel(inv, times, gmst, positions):
-        """inv: (num_sats, 12) precomputed invariants. gmst: (num_times,)."""
+    @cuda.jit(fastmath=fastmath)
+    def propagate(inv, times, gmst, positions):
         t_idx, s_idx0 = cuda.grid(2)
-        num_times = times.shape[0]
+        if t_idx >= times.shape[0]:
+            return
         num_sats = inv.shape[0]
         stride_s = cuda.gridDim.y * cuda.blockDim.y
-
-        if t_idx >= num_times:
-            return
 
         tk = times[t_idx]
         g = gmst[t_idx]
 
         for s_idx in range(s_idx0, num_sats, stride_s):
-            a = inv[s_idx, 0]
-            e = inv[s_idx, 1]
-            n_tot = inv[s_idx, 2]
-            draan = inv[s_idx, 3]
-            dargp = inv[s_idx, 4]
-            M0 = inv[s_idx, 5]
-            raan0 = inv[s_idx, 6]
-            argp0 = inv[s_idx, 7]
-            cos_i = inv[s_idx, 8]
-            sin_i = inv[s_idx, 9]
-            b = inv[s_idx, 10]
-            t = tk - inv[s_idx, 11]
+            a = inv[s_idx, _A]
+            e = inv[s_idx, _E]
+            t = tk
 
-            M = _phase(M0, n_tot, t)
+            M = _phase(inv[s_idx, _M0], inv[s_idx, _NHI], inv[s_idx, _NLO], t)
             sE, cE = _kepler_sincos(M, e)
 
-            x_orb = a * (cE - e)               # == r*cos(nu), no atan2 needed
-            y_orb = b * sE                     # == r*sin(nu)
+            x_orb = a * (cE - e)                       # r*cos(nu), no atan2
+            y_orb = inv[s_idx, _B] * sE                # r*sin(nu)
 
             # Folding -gmst into RAAN makes the ECEF rotation free.
-            raan_t = raan0 + draan * t - g
-            w_t = argp0 + dargp * t
+            raan_t = inv[s_idx, _RAAN0] + inv[s_idx, _DRAAN] * t - g
+            w_t = inv[s_idx, _ARGP0] + inv[s_idx, _DARGP] * t
+            cos_i = inv[s_idx, _COSI]
+            sin_i = inv[s_idx, _SINI]
             sin_w = math.sin(w_t)
             cos_w = math.cos(w_t)
             sin_r = math.sin(raan_t)
@@ -133,95 +210,106 @@ def _make_kernel(dtype):
                                           + (-sin_r * sin_w + cos_r * cos_w * cos_i) * y_orb)
             positions[s_idx, t_idx, 2] = (sin_w * sin_i) * x_orb + (cos_w * sin_i) * y_orb
 
-    _kernel_cache[key] = kernel
-    return kernel
+    _kernel_cache[key] = (prep, propagate)
+    return prep, propagate
 
 
-def _invariants(elements, epochs, dtype):
-    """Per-satellite quantities the original kernel recomputed for every timestep."""
-    el = np.asarray(elements, dtype=np.float64)
-    a, e, inc, raan, argp, M0 = (el[:, k] for k in range(6))
+class Propagator:
+    """
+    Reusable propagator. Holds its device buffers, so repeated calls of the
+    same shape avoid the (large) cost of allocating the output buffer.
 
-    n0 = np.sqrt(MU / a ** 3)
-    j2_scale = (n0 * RE ** 2 * J2) / (a ** 2 * (1.0 - e ** 2) ** 2)
-    sin_i, cos_i = np.sin(inc), np.cos(inc)
+        prop = Propagator(num_sats, num_times)
+        for epoch in epochs:
+            pos = prop.run(elements, times, out='device')   # stays on the GPU
 
-    draan = -1.5 * j2_scale * cos_i
-    dargp = 0.75 * j2_scale * (4.0 - 5.0 * sin_i ** 2)
-    dM = 0.75 * j2_scale * np.sqrt(1.0 - e ** 2) * (2.0 - 3.0 * sin_i ** 2)
+    ``pinned=True`` also allocates a page-locked host buffer; ``out='pinned'``
+    then returns a numpy view of it at full PCIe rate. That buffer is reused,
+    so each call overwrites the array returned by the previous one.
+    """
 
-    inv = np.empty((el.shape[0], 12), dtype=dtype)
-    inv[:, 0] = a
-    inv[:, 1] = e
-    inv[:, 2] = n0 + dM
-    inv[:, 3] = draan
-    inv[:, 4] = dargp
-    inv[:, 5] = np.mod(M0, _TWO_PI)
-    inv[:, 6] = np.mod(raan, _TWO_PI)
-    inv[:, 7] = np.mod(argp, _TWO_PI)
-    inv[:, 8] = cos_i
-    inv[:, 9] = sin_i
-    inv[:, 10] = a * np.sqrt(1.0 - e ** 2)
-    inv[:, 11] = 0.0 if epochs is None else np.asarray(epochs, dtype=np.float64)
-    return inv
+    def __init__(self, num_sats, num_times, dtype=np.float32, pinned=False,
+                 threads=(64, 4), fastmath=True):
+        self.dtype = np.dtype(dtype).type
+        self.num_sats = int(num_sats)
+        self.num_times = int(num_times)
+        self.threads = (int(threads[0]), int(threads[1]))
+        self._prep, self._prop = _make_kernels(self.dtype, fastmath)
+
+        self.d_elements = cuda.device_array((self.num_sats, 6), np.float64)
+        self.d_epochs = cuda.device_array(self.num_sats, np.float64)
+        self.d_inv = cuda.device_array((self.num_sats, _NINV), self.dtype)
+        self.d_times = cuda.device_array(self.num_times, self.dtype)
+        self.d_gmst = cuda.device_array(self.num_times, self.dtype)
+        self.d_pos = cuda.device_array((self.num_sats, self.num_times, 3), self.dtype)
+        self.h_pinned = (cuda.pinned_array((self.num_sats, self.num_times, 3), self.dtype)
+                         if pinned else None)
+        if self.h_pinned is not None:
+            self.h_pinned[:] = 0        # fault the pages in once, not per call
+
+    def run(self, satellite_elements, times, return_frame='ecef', epochs=None,
+            input_type='kepler', out=None):
+        """
+        out=None       -> new numpy array
+        out='device'   -> the internal device array (no transfer)
+        out='pinned'   -> numpy view of the internal pinned buffer (reused!)
+        out=ndarray    -> written in place
+        """
+        if input_type.lower() != 'kepler':
+            raise ValueError("only 'kepler' input_type is supported")
+
+        el = np.ascontiguousarray(satellite_elements, dtype=np.float64)
+        if el.shape != (self.num_sats, 6):
+            raise ValueError(f"expected elements of shape {(self.num_sats, 6)}, got {el.shape}")
+        times = np.asarray(times, dtype=np.float64)
+        if len(times) != self.num_times:
+            raise ValueError(f"expected {self.num_times} times, got {len(times)}")
+
+        # Propagate on a time axis relative to times[0] and rewind the epochs to
+        # the same origin, so no large absolute time is ever stored in float32.
+        # GMST still uses the absolute times when epochs are supplied.
+        t_ref = times[0]
+        times_rel = times - t_ref
+        ep = (np.zeros(self.num_sats, np.float64) if epochs is None
+              else np.ascontiguousarray(epochs, dtype=np.float64) - t_ref)
+        gmst_src = times_rel if epochs is None else times
+        gmst = (gmst_from_seconds(gmst_src) if return_frame.lower() == 'ecef'
+                else np.zeros(self.num_times))
+
+        self.d_elements.copy_to_device(el)
+        self.d_epochs.copy_to_device(ep)
+        self.d_times.copy_to_device(times_rel.astype(self.dtype))
+        self.d_gmst.copy_to_device(gmst.astype(self.dtype))
+
+        self._prep[(self.num_sats + 127) // 128, 128](
+            self.d_elements, self.d_epochs, self.d_inv)
+
+        tpb = self.threads
+        grid = ((self.num_times + tpb[0] - 1) // tpb[0],
+                min(65535, (self.num_sats + tpb[1] - 1) // tpb[1]))
+        self._prop[grid, tpb](self.d_inv, self.d_times, self.d_gmst, self.d_pos)
+
+        if out is None:
+            return self.d_pos.copy_to_host()
+        if isinstance(out, str):
+            if out == 'device':
+                return self.d_pos
+            if out == 'pinned':
+                if self.h_pinned is None:
+                    raise ValueError("Propagator was created with pinned=False")
+                self.d_pos.copy_to_host(self.h_pinned)
+                return np.asarray(self.h_pinned)
+            raise ValueError(f"unknown out mode: {out!r}")
+        self.d_pos.copy_to_host(out)
+        return out
 
 
 def propagate_constellation_cuda_fast(satellite_elements, times, return_frame='ecef',
-                                      epochs=None, input_type='kepler', dtype=np.float32,
-                                      out='host', sat_chunk=None, threads=(64, 4)):
-    """
-    Propagate a constellation on the GPU.
-
-    out='host'   -> numpy array (num_sats, num_times, 3)
-    out='device' -> numba device array, no transfer (use for GPU post-processing)
-    sat_chunk    -> satellites per batch; bounds device memory and overlaps the
-                    device->host copy of one batch with the kernel of the next.
-    """
-    if input_type.lower() != 'kepler':
-        raise ValueError("only 'kepler' input_type is supported")
-
-    dtype = np.dtype(dtype).type
-    kernel = _make_kernel(dtype)
-
-    num_sats = len(satellite_elements)
-    times = np.asarray(times, dtype=np.float64)
-    num_times = len(times)
-
-    times_seconds = times - times[0] if epochs is None else times
-    gmst = np.array([calculate_gmst_from_seconds(s) for s in times_seconds], dtype=dtype)
-    if return_frame.lower() != 'ecef':
-        gmst[:] = 0.0
-
-    inv = _invariants(satellite_elements, epochs, dtype)
-    d_times = cuda.to_device(np.asarray(times_seconds, dtype=dtype))
-    d_gmst = cuda.to_device(gmst)
-
-    tpb = (int(threads[0]), int(threads[1]))
-    grid_x = (num_times + tpb[0] - 1) // tpb[0]
-
-    if out == 'device' or sat_chunk is None:
-        d_inv = cuda.to_device(inv)
-        d_pos = cuda.device_array((num_sats, num_times, 3), dtype=dtype)
-        grid_y = min(65535, (num_sats + tpb[1] - 1) // tpb[1])
-        kernel[(grid_x, grid_y), tpb](d_inv, d_times, d_gmst, d_pos)
-        if out == 'device':
-            return d_pos
-        return d_pos.copy_to_host()
-
-    # Chunked + double buffered: kernel of chunk i+1 overlaps the copy of chunk i.
-    positions = cuda.pinned_array((num_sats, num_times, 3), dtype=dtype)
-    streams = [cuda.stream(), cuda.stream()]
-    bufs = [None, None]
-    for j, s_start in enumerate(range(0, num_sats, sat_chunk)):
-        s_end = min(s_start + sat_chunk, num_sats)
-        n = s_end - s_start
-        st = streams[j % 2]
-        d_inv = cuda.to_device(inv[s_start:s_end], stream=st)
-        if bufs[j % 2] is None or bufs[j % 2].shape[0] != n:
-            bufs[j % 2] = cuda.device_array((n, num_times, 3), dtype=dtype, stream=st)
-        d_pos = bufs[j % 2]
-        grid_y = min(65535, (n + tpb[1] - 1) // tpb[1])
-        kernel[(grid_x, grid_y), tpb, st](d_inv, d_times, d_gmst, d_pos)
-        d_pos.copy_to_host(positions[s_start:s_end], stream=st)
-    cuda.synchronize()
-    return np.asarray(positions)
+                                      epochs=None, input_type='kepler',
+                                      dtype=np.float32, out=None, threads=(64, 4),
+                                      fastmath=True):
+    """One-shot propagation. For repeated calls use Propagator, which reuses buffers."""
+    p = Propagator(len(satellite_elements), len(times), dtype=dtype,
+                   pinned=(out == 'pinned'), threads=threads, fastmath=fastmath)
+    return p.run(satellite_elements, times, return_frame=return_frame, epochs=epochs,
+                 input_type=input_type, out=out)
