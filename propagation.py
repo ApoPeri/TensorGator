@@ -2,7 +2,7 @@ import numpy as np
 from numba import njit, prange
 from .constants import MU, RE, J2
 
-def satellite_positions(times, constellation, backend='cpu', return_frame='ecef', epochs=None, input_type='kepler'):
+def satellite_positions(times, constellation, backend='cpu', return_frame='ecef', epochs=None, input_type='kepler', **kwargs):
     """
     Propagate satellites using the selected backend ('cpu' or 'cuda').
     
@@ -28,11 +28,11 @@ def satellite_positions(times, constellation, backend='cpu', return_frame='ecef'
             raise ValueError(f"CPU backend only supports 'kepler' input_type, not '{input_type}'")
             
         from .prop_cpu import propagate_constellation_cpu
-        from .coord_conv import batch_eci_to_ecef, calculate_gmst_from_seconds
-        
+        from .coord_conv import eci_to_ecef_series
+
         # Propagate constellation using CPU with J2 perturbation
         positions_eci = propagate_constellation_cpu(constellation, times, epochs=epochs)
-        
+
         # Transform ECI to ECEF if needed
         if return_frame.lower() == 'ecef':
             # Handle time references for GMST calculation
@@ -42,27 +42,24 @@ def satellite_positions(times, constellation, backend='cpu', return_frame='ecef'
             else:
                 # If epochs provided, use absolute times
                 times_seconds = times
-                
-            # Initialize ECEF positions array
-            num_sats = len(constellation)
-            num_times = len(times)
-            positions_ecef = np.zeros((num_sats, num_times, 3))
-            
-            # Convert each timestep from ECI to ECEF
-            for t in range(num_times):
-                seconds = times_seconds[t]
-                gmst = calculate_gmst_from_seconds(seconds)
-                positions_at_t = positions_eci[:, t, :]
-                positions_ecef_at_t = batch_eci_to_ecef(positions_at_t, gmst)
-                positions_ecef[:, t, :] = positions_ecef_at_t
-                
-            return positions_ecef
+
+            # One vectorised rotation over the whole series rather than a
+            # python loop calling batch_eci_to_ecef once per timestep.
+            from .coord_conv import gmst_from_seconds
+            gmst = gmst_from_seconds(times_seconds)
+            return eci_to_ecef_series(positions_eci, gmst)
         else:
             # Return ECI coordinates
             return positions_eci
-    elif backend == 'cuda':
-        from .prop_cuda import propagate_constellation_cuda
-        return propagate_constellation_cuda(constellation, times, return_frame=return_frame, 
-                                           epochs=epochs, input_type=input_type)
+    elif backend in ('cuda', 'cuda_fast'):
+        # 'cuda_fast' is kept as an alias; 'cuda' now uses the optimised kernel.
+        # Extra keywords (dtype, out) are forwarded to prop_cuda_fast.
+        from .prop_cuda_fast import propagate_constellation_cuda_fast
+        return propagate_constellation_cuda_fast(constellation, times, return_frame=return_frame,
+                                                 epochs=epochs, input_type=input_type, **kwargs)
+    elif backend == 'cuda_legacy':
+        from .prop_cuda import propagate_constellation_cuda_legacy
+        return propagate_constellation_cuda_legacy(constellation, times, return_frame=return_frame,
+                                                   epochs=epochs, input_type=input_type)
     else:
         raise ValueError(f"Unknown backend: {backend}")
