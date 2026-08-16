@@ -265,3 +265,7 @@ Thumbs.db
 *.temp
 *.bak
 *.backup
+# test/benchmark output
+cpu_cuda_comparison.png
+cpu_cuda_comparison_intermediates.csv
+orbits.png
